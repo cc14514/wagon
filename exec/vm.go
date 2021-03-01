@@ -99,21 +99,22 @@ func EnableAOT(v bool) VMOption {
 	}
 }
 
-var funcsCache = new(sync.Map)
+type CodeMeta struct {
+	Code []byte
+	Meta *compile.BytecodeMetadata
+}
 
-func getFuncs(module *wasm.Module) ([]function, error) {
-	funcs := make([]function, len(module.FunctionIndexSpace))
+var disassemblyCache = new(sync.Map)
+var codeMetaCache = new(sync.Map)
+
+func getFuncs(module *wasm.Module) (funcs []function, err error) {
+	funcs = make([]function, len(module.FunctionIndexSpace))
+
 	s1 := sha1.New()
 	s1.Write(module.Code.Bytes)
 	s1.Write(module.Data.Bytes)
 	s1b := s1.Sum(nil)
 	s1h := hex.EncodeToString(s1b)
-	val, ok := funcsCache.Load(s1h)
-	if ok {
-		_funcs := val.([]function)
-		copy(funcs, _funcs)
-		return funcs, nil
-	}
 
 	nNatives := 0
 	for i, fn := range module.FunctionIndexSpace {
@@ -125,9 +126,20 @@ func getFuncs(module *wasm.Module) ([]function, error) {
 			nNatives++
 			continue
 		}
-		disassembly, err := disasm.NewDisassembly(fn, module)
-		if err != nil {
-			return nil, err
+		s1.Reset()
+		s1.Write(fn.Body.Code)
+		fhb := s1.Sum(nil)
+		fh := hex.EncodeToString(fhb)
+		var disassembly *disasm.Disassembly
+		_disassembly, ok := disassemblyCache.Load(s1h + fh)
+		if ok {
+			disassembly = _disassembly.(*disasm.Disassembly)
+		} else {
+			disassembly, err = disasm.NewDisassembly(fn, module)
+			if err != nil {
+				return nil, err
+			}
+			disassemblyCache.Store(s1h+fh, disassembly)
 		}
 
 		totalLocalVars := 0
@@ -135,7 +147,21 @@ func getFuncs(module *wasm.Module) ([]function, error) {
 		for _, entry := range fn.Body.Locals {
 			totalLocalVars += int(entry.Count)
 		}
-		code, meta := compile.Compile(disassembly.Code)
+
+		var code []byte
+		var meta *compile.BytecodeMetadata
+		_codeMeta, ok := codeMetaCache.Load(s1h + fh)
+		if ok {
+			cm := _codeMeta.(*CodeMeta)
+			code, meta = cm.Code, cm.Meta
+		} else {
+			code, meta = compile.Compile(disassembly.Code)
+			codeMetaCache.Store(s1h+fh, &CodeMeta{
+				Code: code,
+				Meta: meta,
+			})
+		}
+
 		funcs[i] = compiledFunction{
 			codeMeta:       meta,
 			code:           code,
@@ -146,7 +172,6 @@ func getFuncs(module *wasm.Module) ([]function, error) {
 			returns:        len(fn.Sig.ReturnTypes) != 0,
 		}
 	}
-	funcsCache.Store(s1h, funcs)
 	return funcs, nil
 }
 
