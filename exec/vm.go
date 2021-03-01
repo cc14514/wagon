@@ -6,11 +6,14 @@
 package exec
 
 import (
+	"crypto/sha1"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"math"
+	"sync"
 
 	"github.com/go-interpreter/wagon/disasm"
 	"github.com/go-interpreter/wagon/exec/internal/compile"
@@ -96,6 +99,57 @@ func EnableAOT(v bool) VMOption {
 	}
 }
 
+var funcsCache = new(sync.Map)
+
+func getFuncs(module *wasm.Module) ([]function, error) {
+	funcs := make([]function, len(module.FunctionIndexSpace))
+	s1 := sha1.New()
+	s1.Write(module.Code.Bytes)
+	s1.Write(module.Data.Bytes)
+	s1b := s1.Sum(nil)
+	s1h := hex.EncodeToString(s1b)
+	val, ok := funcsCache.Load(s1h)
+	if ok {
+		_funcs := val.([]function)
+		copy(funcs, _funcs)
+		return funcs, nil
+	}
+
+	nNatives := 0
+	for i, fn := range module.FunctionIndexSpace {
+		if fn.IsHost() {
+			funcs[i] = goFunction{
+				typ: fn.Host.Type(),
+				val: fn.Host,
+			}
+			nNatives++
+			continue
+		}
+		disassembly, err := disasm.NewDisassembly(fn, module)
+		if err != nil {
+			return nil, err
+		}
+
+		totalLocalVars := 0
+		totalLocalVars += len(fn.Sig.ParamTypes)
+		for _, entry := range fn.Body.Locals {
+			totalLocalVars += int(entry.Count)
+		}
+		code, meta := compile.Compile(disassembly.Code)
+		funcs[i] = compiledFunction{
+			codeMeta:       meta,
+			code:           code,
+			branchTables:   meta.BranchTables,
+			maxDepth:       disassembly.MaxDepth,
+			totalLocalVars: totalLocalVars,
+			args:           len(fn.Sig.ParamTypes),
+			returns:        len(fn.Sig.ReturnTypes) != 0,
+		}
+	}
+	funcsCache.Store(s1h, funcs)
+	return funcs, nil
+}
+
 // NewVM creates a new VM from a given module and options. If the module defines
 // a start function, it will be executed.
 func NewVM(module *wasm.Module, opts ...VMOption) (*VM, error) {
@@ -113,50 +167,56 @@ func NewVM(module *wasm.Module, opts ...VMOption) (*VM, error) {
 		copy(vm.memory, module.LinearMemoryIndexSpace[0])
 	}
 
-	vm.funcs = make([]function, len(module.FunctionIndexSpace))
+	//vm.funcs = make([]function, len(module.FunctionIndexSpace))
+	var err error
+	vm.funcs, err = getFuncs(module)
+	if err != nil {
+		return nil, err
+	}
 	vm.globals = make([]uint64, len(module.GlobalIndexSpace))
 	vm.newFuncTable()
 	vm.module = module
+	/*
+		nNatives := 0
 
-	nNatives := 0
-	for i, fn := range module.FunctionIndexSpace {
-		// Skip native methods as they need not be
-		// disassembled; simply add them at the end
-		// of the `funcs` array as is, as specified
-		// in the spec. See the "host functions"
-		// section of:
-		// https://webassembly.github.io/spec/core/exec/modules.html#allocation
-		if fn.IsHost() {
-			vm.funcs[i] = goFunction{
-				typ: fn.Host.Type(),
-				val: fn.Host,
+		for i, fn := range module.FunctionIndexSpace {
+			// Skip native methods as they need not be
+			// disassembled; simply add them at the end
+			// of the `funcs` array as is, as specified
+			// in the spec. See the "host functions"
+			// section of:
+			// https://webassembly.github.io/spec/core/exec/modules.html#allocation
+			if fn.IsHost() {
+				vm.funcs[i] = goFunction{
+					typ: fn.Host.Type(),
+					val: fn.Host,
+				}
+				nNatives++
+				continue
 			}
-			nNatives++
-			continue
-		}
 
-		disassembly, err := disasm.NewDisassembly(fn, module)
-		if err != nil {
-			return nil, err
-		}
+			disassembly, err := disasm.NewDisassembly(fn, module)
+			if err != nil {
+				return nil, err
+			}
 
-		totalLocalVars := 0
-		totalLocalVars += len(fn.Sig.ParamTypes)
-		for _, entry := range fn.Body.Locals {
-			totalLocalVars += int(entry.Count)
+			totalLocalVars := 0
+			totalLocalVars += len(fn.Sig.ParamTypes)
+			for _, entry := range fn.Body.Locals {
+				totalLocalVars += int(entry.Count)
+			}
+			code, meta := compile.Compile(disassembly.Code)
+			vm.funcs[i] = compiledFunction{
+				codeMeta:       meta,
+				code:           code,
+				branchTables:   meta.BranchTables,
+				maxDepth:       disassembly.MaxDepth,
+				totalLocalVars: totalLocalVars,
+				args:           len(fn.Sig.ParamTypes),
+				returns:        len(fn.Sig.ReturnTypes) != 0,
+			}
 		}
-		code, meta := compile.Compile(disassembly.Code)
-		vm.funcs[i] = compiledFunction{
-			codeMeta:       meta,
-			code:           code,
-			branchTables:   meta.BranchTables,
-			maxDepth:       disassembly.MaxDepth,
-			totalLocalVars: totalLocalVars,
-			args:           len(fn.Sig.ParamTypes),
-			returns:        len(fn.Sig.ReturnTypes) != 0,
-		}
-	}
-
+	*/
 	if err := vm.resetGlobals(); err != nil {
 		return nil, err
 	}
